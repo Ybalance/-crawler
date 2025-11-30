@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>智能网络爬虫系统</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="css/style.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <!-- 头部 -->
+        <header class="header">
+            <div class="header-left">
+                <i class="fas fa-spider"></i>
+                <h1>智能网络爬虫系统</h1>
+            </div>
+            <div class="header-right">
+                <button class="theme-toggle" onclick="toggleTheme()" title="切换主题">
+                    <i class="fas fa-moon"></i>
+                </button>
+                <div class="connection-status" id="connectionStatus">
+                    <i class="fas fa-circle"></i>
+                    <span>连接中...</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- 主内容区 -->
+        <div class="main-content">
+            <!-- 侧边栏 -->
+            <aside class="sidebar">
+                <div class="sidebar-header">
+                    <h3>任务列表</h3>
+                    <button class="btn btn-primary btn-sm" onclick="showCreateTaskModal()">
+                        <i class="fas fa-plus"></i> 新建任务
+                    </button>
+                </div>
+                <div class="task-list" id="taskList">
+                    <div class="empty-state">
+                        <i class="fas fa-inbox"></i>
+                        <p>暂无任务</p>
+                    </div>
+                </div>
+            </aside>
+
+            <!-- 内容区 -->
+            <main class="content">
+                <!-- 标签页导航 -->
+                <div class="tabs">
+                    <button class="tab-btn active" data-tab="monitor" onclick="switchTab('monitor')">
+                        <i class="fas fa-chart-line"></i> 实时监控
+                    </button>
+                    <button class="tab-btn" data-tab="urls" onclick="switchTab('urls')">
+                        <i class="fas fa-link"></i> URL列表
+                    </button>
+                    <button class="tab-btn" data-tab="stats" onclick="switchTab('stats')">
+                        <i class="fas fa-chart-pie"></i> 数据分析
+                    </button>
+                    <button class="tab-btn" data-tab="logs" onclick="switchTab('logs')">
+                        <i class="fas fa-file-alt"></i> 操作日志
+                    </button>
+                </div>
+
+                <!-- 标签页内容 -->
+                <div class="tab-content">
+                    <!-- 实时监控 -->
+                    <div class="tab-pane active" id="monitor">
+                        <div class="monitor-container">
+                            <!-- 任务控制 -->
+                            <div class="control-panel">
+                                <div class="task-info">
+                                    <div class="task-title-row">
+                                        <h2 id="currentTaskName">请选择一个任务</h2>
+                                        <button class="btn-icon" onclick="showEditTaskModal()" id="btnEditTask" title="编辑任务配置" style="display:none;">
+                                            <i class="fas fa-cog"></i>
+                                        </button>
+                                    </div>
+                                    <span class="task-status" id="currentTaskStatus">-</span>
+                                </div>
+                                <div class="control-buttons">
+                                    <button class="btn btn-success" onclick="startTask()" id="btnStart">
+                                        <i class="fas fa-play"></i> 开始
+                                    </button>
+                                    <button class="btn btn-warning" onclick="pauseTask()" id="btnPause" disabled>
+                                        <i class="fas fa-pause"></i> 暂停
+                                    </button>
+                                    <button class="btn btn-info" onclick="resumeTask()" id="btnResume" disabled>
+                                        <i class="fas fa-play-circle"></i> 继续
+                                    </button>
+                                    <button class="btn btn-danger" onclick="stopTask()" id="btnStop" disabled>
+                                        <i class="fas fa-stop"></i> 停止
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- 进度显示 -->
+                            <div class="progress-section">
+                                <div class="progress-header">
+                                    <span>总体进度</span>
+                                    <span id="progressText">0%</span>
+                                </div>
+                                <div class="progress-bar">
+                                    <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+                                </div>
+                            </div>
+
+                            <!-- 统计卡片 -->
+                            <div class="stats-grid">
+                                <div class="stat-card">
+                                    <div class="stat-icon" style="background: #4CAF50;">
+                                        <i class="fas fa-link"></i>
+                                    </div>
+                                    <div class="stat-info">
+                                        <div class="stat-label">队列URL</div>
+                                        <div class="stat-value" id="statTotalUrls">0</div>
+                                    </div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-icon" style="background: #2196F3;">
+                                        <i class="fas fa-check-circle"></i>
+                                    </div>
+                                    <div class="stat-info">
+                                        <div class="stat-label">已完成</div>
+                                        <div class="stat-value" id="statCompleted">0</div>
+                                    </div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-icon" style="background: #f44336;">
+                                        <i class="fas fa-times-circle"></i>
+                                    </div>
+                                    <div class="stat-info">
+                                        <div class="stat-label">失败</div>
+                                        <div class="stat-value" id="statFailed">0</div>
+                                    </div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-icon" style="background: #FF9800;">
+                                        <i class="fas fa-percentage"></i>
+                                    </div>
+                                    <div class="stat-info">
+                                        <div class="stat-label">成功率</div>
+                                        <div class="stat-value" id="statSuccessRate">0%</div>
+                                    </div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-icon" style="background: #9C27B0;">
+                                        <i class="fas fa-database"></i>
+                                    </div>
+                                    <div class="stat-info">
+                                        <div class="stat-label">总流量</div>
+                                        <div class="stat-value" id="statTotalBytes">0 B</div>
+                                    </div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-icon" style="background: #FF5722;">
+                                        <i class="fas fa-tachometer-alt"></i>
+                                    </div>
+                                    <div class="stat-info">
+                                        <div class="stat-label">瞬间流量</div>
+                                        <div class="stat-value" id="statInstantSpeed">0 KB/s</div>
+                                    </div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-icon" style="background: #00BCD4;">
+                                        <i class="fas fa-clock"></i>
+                                    </div>
+                                    <div class="stat-info">
+                                        <div class="stat-label">平均响应</div>
+                                        <div class="stat-value" id="statAvgResponse">0 ms</div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- 线程状态 -->
+                            <div class="threads-section">
+                                <h3><i class="fas fa-server"></i> 线程状态</h3>
+                                <div class="threads-grid" id="threadsGrid">
+                                    <div class="empty-state">
+                                        <i class="fas fa-info-circle"></i>
+                                        <p>等待任务启动...</p>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- 总流量图表 -->
+                            <div class="chart-section">
+                                <h3><i class="fas fa-chart-area"></i> 总流量监控</h3>
+                                <canvas id="trafficChart"></canvas>
+                            </div>
+                            
+                            <!-- 瞬间流量图表 -->
+                            <div class="chart-section">
+                                <h3><i class="fas fa-tachometer-alt"></i> 瞬间流量监控</h3>
+                                <canvas id="speedChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- URL列表 -->
+                    <div class="tab-pane" id="urls">
+                        <div class="urls-container">
+                            <div class="urls-header">
+                                <div class="urls-filters">
+                                    <select id="urlStatusFilter" onchange="resetPageAndLoad()">
+                                        <option value="">全部状态</option>
+                                        <option value="completed">已完成</option>
+                                        <option value="failed">失败</option>
+                                        <option value="pending">待处理</option>
+                                        <option value="robots_blocked">Robots禁止</option>
+                                    </select>
+                                    <input type="text" id="urlPrefixSearch" placeholder="搜索URL (如: www.bilibili.com)" 
+                                           onkeyup="debounceSearch()" class="url-search-input">
+                                    <select id="urlExtFilter" onchange="resetPageAndLoad()">
+                                        <option value="">全部类型</option>
+                                        <option value=".html">.html</option>
+                                        <option value=".htm">.htm</option>
+                                        <option value=".php">.php</option>
+                                        <option value=".asp">.asp</option>
+                                        <option value=".jsp">.jsp</option>
+                                        <option value=".js">.js</option>
+                                        <option value=".css">.css</option>
+                                        <option value=".json">.json</option>
+                                        <option value=".xml">.xml</option>
+                                        <option value=".jpg">.jpg</option>
+                                        <option value=".png">.png</option>
+                                        <option value=".gif">.gif</option>
+                                        <option value=".pdf">.pdf</option>
+                                        <option value=".mp4">.mp4</option>
+                                        <option value=".mp3">.mp3</option>
+                                    </select>
+                                    <button class="btn btn-sm" onclick="refreshUrls()" title="刷新列表">
+                                        <i class="fas fa-sync-alt"></i>
+                                    </button>
+                                    <button class="btn btn-sm" onclick="expandAllNodes()" title="展开全部">
+                                        <i class="fas fa-expand-alt"></i>
+                                    </button>
+                                    <button class="btn btn-sm" onclick="collapseAllNodes()" title="折叠全部">
+                                        <i class="fas fa-compress-alt"></i>
+                                    </button>
+                                    <button class="btn btn-success btn-sm" onclick="exportFilteredUrls()" title="导出CSV文件">
+                                        <i class="fas fa-file-csv"></i> 导出CSV
+                                    </button>
+                                    <button class="btn btn-primary btn-sm" onclick="exportFilesZip()" title="导出文件压缩包">
+                                        <i class="fas fa-file-archive"></i> 导出文件
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="url-tree-container" id="urlTreeContainer">
+                                <div class="url-tree" id="urlTree">
+                                    <div class="empty-state">
+                                        <i class="fas fa-inbox"></i>
+                                        <p>暂无数据</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 数据分析 -->
+                    <div class="tab-pane" id="stats">
+                        <div class="stats-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                            <h3><i class="fas fa-chart-line"></i> 数据分析</h3>
+                            <button class="btn btn-primary btn-sm" onclick="refreshAnalysisCharts()" title="刷新数据分析">
+                                <i class="fas fa-sync-alt"></i> 刷新
+                            </button>
+                        </div>
+                        <div class="stats-container">
+                            <div class="stats-row">
+                                <div class="stats-card">
+                                    <h3><i class="fas fa-file"></i> 文件类型分布</h3>
+                                    <canvas id="fileTypeChart"></canvas>
+                                </div>
+                                <div class="stats-card">
+                                    <h3><i class="fas fa-chart-bar"></i> 状态分布</h3>
+                                    <canvas id="statusChart"></canvas>
+                                </div>
+                            </div>
+                            <div class="stats-row">
+                                <div class="stats-card">
+                                    <h3><i class="fas fa-layer-group"></i> 深度分布</h3>
+                                    <canvas id="depthChart"></canvas>
+                                </div>
+                                <div class="stats-card">
+                                    <h3><i class="fas fa-chart-pie"></i> 文件大小分布</h3>
+                                    <canvas id="sizeChart"></canvas>
+                                </div>
+                            </div>
+                            <div class="stats-row">
+                                <div class="stats-card">
+                                    <h3><i class="fas fa-clock"></i> 响应时间分布</h3>
+                                    <canvas id="responseTimeChart"></canvas>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 操作日志 -->
+                    <div class="tab-pane" id="logs">
+                        <div class="logs-container">
+                            <div class="logs-header">
+                                <h3><i class="fas fa-list"></i> 操作日志</h3>
+                                <button class="btn btn-secondary btn-sm" onclick="clearLogs()">
+                                    <i class="fas fa-trash"></i> 清空
+                                </button>
+                            </div>
+                            <div class="logs-content" id="logsContent">
+                                <div class="log-entry log-info">
+                                    <span class="log-time">[2024-01-01 00:00:00]</span>
+                                    <span class="log-message">系统已启动</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <!-- 创建任务模态框 -->
+    <div class="modal" id="createTaskModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>创建新任务</h2>
+                <button class="modal-close" onclick="closeCreateTaskModal()">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <form id="createTaskForm" onsubmit="createTask(event)">
+                    <div class="form-group">
+                        <label>任务名称 *</label>
+                        <input type="text" name="name" required placeholder="例如: 爬取示例网站">
+                    </div>
+                    <div class="form-group">
+                        <label>起始URL *</label>
+                        <input type="url" name="url" required placeholder="https://example.com">
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>爬取策略</label>
+                            <select name="strategy">
+                                <option value="bfs">广度优先(BFS)</option>
+                                <option value="dfs">深度优先(DFS)</option>
+                                <option value="priority">优先级策略</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>最大深度</label>
+                            <input type="number" name="max_depth" value="3" min="1" max="10">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>线程数</label>
+                            <input type="number" name="thread_count" value="3" min="1" max="10">
+                        </div>
+                        <div class="form-group">
+                            <label>请求间隔(秒)</label>
+                            <input type="number" name="request_interval" value="1.0" min="0.1" max="10" step="0.1">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>重试次数</label>
+                            <input type="number" name="retry_times" value="3" min="0" max="10">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" name="respect_robots" checked>
+                            <span>遵守 robots.txt 协议</span>
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" name="allow_cross_domain">
+                            <span>允许跨域爬取</span>
+                        </label>
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-secondary" onclick="closeCreateTaskModal()">
+                            取消
+                        </button>
+                        <button type="submit" class="btn btn-primary">
+                            <i class="fas fa-plus"></i> 创建任务
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- 编辑任务模态框 -->
+    <div class="modal" id="editTaskModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>编辑任务配置</h2>
+                <button class="modal-close" onclick="closeEditTaskModal()">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <form id="editTaskForm" onsubmit="updateTask(event)">
+                    <input type="hidden" name="id" id="editTaskId">
+                    <div class="form-group">
+                        <label>任务名称 *</label>
+                        <input type="text" name="name" id="editTaskName" required placeholder="例如: 爬取示例网站">
+                    </div>
+                    <div class="form-group">
+                        <label>起始URL *</label>
+                        <input type="url" name="url" id="editTaskUrl" required placeholder="https://example.com">
+                        <small class="form-hint">⚠️ 修改URL将在下次启动时生效</small>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>爬取策略</label>
+                            <select name="strategy" id="editTaskStrategy">
+                                <option value="bfs">广度优先(BFS)</option>
+                                <option value="dfs">深度优先(DFS)</option>
+                                <option value="priority">优先级策略</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>最大深度</label>
+                            <input type="number" name="max_depth" id="editTaskMaxDepth" value="3" min="1" max="10">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>线程数</label>
+                            <input type="number" name="thread_count" id="editTaskThreadCount" value="3" min="1" max="10">
+                        </div>
+                        <div class="form-group">
+                            <label>请求间隔(秒)</label>
+                            <input type="number" name="request_interval" id="editTaskInterval" value="1.0" min="0.1" max="10" step="0.1">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>重试次数</label>
+                            <input type="number" name="retry_times" id="editTaskRetry" value="3" min="0" max="10">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" name="respect_robots" id="editTaskRobots">
+                            <span>遵守 robots.txt 协议</span>
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" name="allow_cross_domain" id="editTaskCrossDomain">
+                            <span>允许跨域爬取</span>
+                        </label>
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-secondary" onclick="closeEditTaskModal()">
+                            取消
+                        </button>
+                        <button type="submit" class="btn btn-primary">
+                            <i class="fas fa-save"></i> 保存修改
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- 加载库 -->
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>
