@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>智能网络爬虫系统</title>
+    <title>爬虫系统</title>
     <link rel="icon" href="data:,">
     <link rel="stylesheet" href="css/style.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
@@ -15,7 +15,7 @@
         <header class="header">
             <div class="header-left">
                 <i class="fas fa-spider"></i>
-                <h1>智能网络爬虫系统</h1>
+                <h1>爬虫系统</h1>
             </div>
             <div class="header-right">
                 <button class="theme-toggle" onclick="toggleTheme()" title="切换主题">
@@ -84,11 +84,17 @@
                                     <button class="btn btn-success" onclick="startTask()" id="btnStart">
                                         <i class="fas fa-play"></i> 开始
                                     </button>
-                                    <button class="btn btn-warning" onclick="pauseTask()" id="btnPause" disabled>
-                                        <i class="fas fa-pause"></i> 暂停
+                                    <button class="btn btn-warning" onclick="pauseCrawling()" id="btnPauseCrawling" disabled>
+                                        <i class="fas fa-pause"></i> 爬取暂停
                                     </button>
-                                    <button class="btn btn-info" onclick="resumeTask()" id="btnResume" disabled>
-                                        <i class="fas fa-play-circle"></i> 继续
+                                    <button class="btn btn-info" onclick="resumeCrawling()" id="btnResumeCrawling" disabled>
+                                        <i class="fas fa-play-circle"></i> 爬取继续
+                                    </button>
+                                    <button class="btn btn-dark" onclick="pauseQueue()" id="btnPauseQueue" disabled>
+                                        <i class="fas fa-pause-circle"></i> 队列暂停
+                                    </button>
+                                    <button class="btn btn-primary" onclick="resumeQueue()" id="btnResumeQueue" disabled>
+                                        <i class="fas fa-play-circle"></i> 队列继续
                                     </button>
                                     <button class="btn btn-danger" onclick="stopTask()" id="btnStop" disabled>
                                         <i class="fas fa-stop"></i> 停止

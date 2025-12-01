@@ -22,16 +22,15 @@ from collections import defaultdict
 from typing import Set, Dict, List, Optional
 
 from flask import Flask, request, jsonify, send_from_directory
-from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_cors import CORS
 from bs4 import BeautifulSoup
 
-# 配置日志
+# 配置日志 - 只输出到控制台，不保存到文件
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('crawler.log'),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -46,9 +45,8 @@ logging.getLogger('engineio').setLevel(logging.WARNING)
 app = Flask(__name__, static_folder='web', static_url_path='')
 app.config['SECRET_KEY'] = 'your-secret-key-here'
 CORS(app)
-# 暂时禁用SocketIO，避免AssertionError
-# socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
-socketio = None
+# 启用SocketIO用于WebSocket实时通信
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # Flask错误处理
 @app.errorhandler(404)
@@ -124,6 +122,7 @@ class Database:
                 respect_robots BOOLEAN DEFAULT 1,
                 allow_cross_domain BOOLEAN DEFAULT 0,
                 status TEXT DEFAULT 'pending',
+                queue_status TEXT DEFAULT 'active',
                 progress REAL DEFAULT 0.0,
                 total_urls INTEGER DEFAULT 0,
                 completed_urls INTEGER DEFAULT 0,
@@ -136,6 +135,14 @@ class Database:
                 finished_at TEXT
             )
         ''')
+        
+        # 检查并添加queue_status字段（用于数据库迁移）
+        try:
+            cursor.execute("SELECT queue_status FROM tasks LIMIT 1")
+        except:
+            # 字段不存在，添加它
+            cursor.execute("ALTER TABLE tasks ADD COLUMN queue_status TEXT DEFAULT 'active'")
+            logger.info("Added queue_status column to tasks table")
         
         # 创建URL记录表
         cursor.execute('''
@@ -213,6 +220,7 @@ class CrawlerThread(threading.Thread):
         # 爬虫状态
         self.status = 'running'
         self.paused = False
+        self.queue_paused = False  # 队列暂停状态
         self.stopped = False
         self.manually_stopped = False  # 标记是否手动停止
         
@@ -233,9 +241,10 @@ class CrawlerThread(threading.Thread):
         self.duplicate_count = 0        # 重复URL数量
         self.robots_blocked_count = 0   # 被robots.txt阻止的URL数量
         
-        # robots.txt解析器
-        self.robot_parser = None
-        if self.config.get('respect_robots', True):
+        # robots.txt解析器字典，按域名存储
+        self.robot_parsers = {}
+        self.respect_robots = self.config.get('respect_robots', True)
+        if self.respect_robots:
             self._init_robot_parser()
         self.total_bytes = 0
         self.response_times = []
@@ -256,12 +265,12 @@ class CrawlerThread(threading.Thread):
         self.url_queue.put((0, 0, start_url))  # (priority, depth, url)
         self.queued_urls.add(start_url)  # 标记起始URL为已加入队列
         
+        # 保存起始URL记录到数据库 (深度0)
+        self.save_url_record(start_url, 0, 'pending', 0, 0, 0, '', None)
+        
         # 如果是新任务，设置发现URL数量为1
         if self.total_urls_discovered == 0:
             self.total_urls_discovered = 1  # 起始URL加入队列
-        
-        # 为起始URL创建pending记录
-        self.save_url_record(start_url, 0, 'pending', 0, 0, 0, '', None)
         
         
         logger.info(f"Crawler initialized for task {task_id}: {start_url}")
@@ -291,11 +300,12 @@ class CrawlerThread(threading.Thread):
             ''', (self.task_id,))
             url_stats = cursor.fetchone()
             
-            # 获取tasks表中的数据作为备选
+            # 获取tasks表中的数据作为备选，包括队列状态
             cursor.execute('''
                 SELECT COALESCE(total_urls, 0) as total_urls, 
                        COALESCE(completed_urls, 0) as completed_urls,
-                       COALESCE(failed_urls, 0) as failed_urls, 
+                       COALESCE(failed_urls, 0) as failed_urls,
+                       COALESCE(queue_status, 'active') as queue_status, 
                        COALESCE(total_bytes, 0) as total_bytes 
                 FROM tasks WHERE id = ?
             ''', (self.task_id,))
@@ -320,6 +330,14 @@ class CrawlerThread(threading.Thread):
                           f"failed={self.failed_count}, bytes={self.total_bytes}")
             else:
                 logger.warning(f"Task {self.task_id}: No stats found, using defaults")
+            
+            # 设置队列状态
+            if task_stats:
+                queue_status = task_stats['queue_status'] or 'active'
+                self.queue_paused = (queue_status == 'paused')
+                logger.info(f"Task {self.task_id}: Queue status restored - {queue_status}")
+            else:
+                self.queue_paused = False
                 
             self.total_urls_processed = self.completed_count + self.failed_count
             
@@ -333,42 +351,73 @@ class CrawlerThread(threading.Thread):
             self.total_urls_processed = 0
     
     def _init_robot_parser(self):
-        """初始化robots.txt解析器"""
+        """初始化起始域名的robots.txt解析器"""
         try:
             parsed = urlparse(self.config['url'])
-            robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+            domain = f"{parsed.scheme}://{parsed.netloc}"
+            self._load_robots_for_domain(domain)
+        except Exception as e:
+            logger.warning(f"Task {self.task_id}: Failed to initialize robots parser: {e}")
+    
+    def _load_robots_for_domain(self, domain: str):
+        """为指定域名加载robots.txt"""
+        if domain in self.robot_parsers:
+            return  # 已经加载过
+        
+        try:
+            robots_url = f"{domain}/robots.txt"
+            robot_parser = RobotFileParser()
+            robot_parser.set_url(robots_url)
+            robot_parser.read()
             
-            self.robot_parser = RobotFileParser()
-            self.robot_parser.set_url(robots_url)
-            self.robot_parser.read()
-            
+            self.robot_parsers[domain] = robot_parser
             logger.info(f"Task {self.task_id}: Loaded robots.txt from {robots_url}")
         except Exception as e:
-            logger.warning(f"Task {self.task_id}: Failed to load robots.txt: {e}")
-            self.robot_parser = None
+            logger.warning(f"Task {self.task_id}: Failed to load robots.txt from {domain}: {e}")
+            self.robot_parsers[domain] = None
     
     def can_fetch(self, url: str) -> bool:
         """检查URL是否被robots.txt允许爬取"""
         # 如果不遵守robots协议，直接返回True
-        if not self.config.get('respect_robots', True):
-            return True
-        
-        # 如果没有robot_parser，允许爬取
-        if not self.robot_parser:
+        if not self.respect_robots:
             return True
         
         try:
+            # 获取URL的域名
+            parsed = urlparse(url)
+            domain = f"{parsed.scheme}://{parsed.netloc}"
+            
+            # 动态加载该域名的robots.txt（如果还没加载）
+            if domain not in self.robot_parsers:
+                self._load_robots_for_domain(domain)
+            
+            # 获取该域名的robots解析器
+            robot_parser = self.robot_parsers.get(domain)
+            if not robot_parser:
+                return True  # 如果加载失败，允许爬取
+            
             # 使用通配符User-Agent检查
-            return self.robot_parser.can_fetch("*", url)
+            return robot_parser.can_fetch("*", url)
         except Exception as e:
             logger.warning(f"Error checking robots.txt for {url}: {e}")
             return True
     
     def is_same_domain(self, url: str) -> bool:
         """检查是否同域"""
-        base_domain = urlparse(self.config['url']).netloc
+        base_url = self.config['url']
+        
+        # 如果基础URL没有协议，添加http://
+        if not base_url.startswith(('http://', 'https://')):
+            base_url = 'http://' + base_url
+            
+        base_domain = urlparse(base_url).netloc
         url_domain = urlparse(url).netloc
-        return base_domain == url_domain
+        
+        # 移除www前缀进行比较，避免www和非www的差异
+        base_domain_clean = base_domain.replace('www.', '') if base_domain.startswith('www.') else base_domain
+        url_domain_clean = url_domain.replace('www.', '') if url_domain.startswith('www.') else url_domain
+        
+        return base_domain == url_domain or base_domain_clean == url_domain_clean
     
     @staticmethod
     def normalize_url(url: str) -> str:
@@ -635,18 +684,11 @@ class CrawlerThread(threading.Thread):
                     try:
                         html = content.decode('utf-8', errors='ignore')
                         metadata = self.extract_metadata(html)
-                        # 保存页面内容到metadata中（用于下载）
-                        metadata['content'] = html
+                        # 不再保存内容到数据库，下载时直接重新获取
                         self.extract_links(url, html, depth)
                     except Exception as e:
                         logger.warning(f"Failed to extract content from {url}: {e}")
-                elif content:
-                    # 对于非HTML文件，也保存内容
-                    try:
-                        if file_size < 5 * 1024 * 1024:  # 只保存小于5MB的文件
-                            metadata['content'] = content.decode('utf-8', errors='ignore') if 'text/' in content_type else content.hex()
-                    except Exception as e:
-                        logger.warning(f"Failed to save content for {url}: {e}")
+                # 不再缓存任何文件内容到数据库
                 
                 # 更新记录状态（包含元数据）
                 self.update_url_record(url, 'completed', status_code, response_time, 
@@ -780,6 +822,11 @@ class CrawlerThread(threading.Thread):
     
     def extract_links(self, base_url: str, html: str, depth: int):
         """提取页面中的链接"""
+        # 如果队列暂停，不提取新链接
+        if self.queue_paused:
+            logger.info(f"Queue is paused, skipping link extraction for {base_url}")
+            return
+            
         try:
             soup = BeautifulSoup(html, 'lxml')
             links = set()
@@ -825,19 +872,18 @@ class CrawlerThread(threading.Thread):
                             duplicates += 1
                             continue
                     
+                    # 先检查跨域（优先级最高）
+                    if not self.config.get('allow_cross_domain', False) and not self.is_same_domain(absolute_url):
+                        cross_domain_blocked += 1
+                        logger.debug(f"URL blocked by cross-domain policy: {absolute_url}")
+                        continue
                     
-                    # 检查robots.txt
+                    # 再检查robots.txt（只检查本域或允许的跨域URL）
                     if not self.can_fetch(absolute_url):
                         robots_blocked += 1
                         logger.info(f"URL blocked by robots.txt: {absolute_url}")
                         # 保存被robots禁止的URL记录
                         self.save_url_record(absolute_url, depth + 1, 'robots_blocked', 0, 0, 0, '', None)
-                        continue
-                    
-                    # 检查跨域
-                    if not self.config.get('allow_cross_domain', False) and not self.is_same_domain(absolute_url):
-                        cross_domain_blocked += 1
-                        logger.debug(f"URL blocked by cross-domain policy: {absolute_url}")
                         continue
                     
                     # 检查深度限制
@@ -912,8 +958,12 @@ class CrawlerThread(threading.Thread):
             keywords = metadata.get('keywords', '') if metadata else ''
             publish_time = metadata.get('publish_time', '') if metadata else ''
             
-            # 保存完整的metadata为JSON字符串
-            metadata_json = json.dumps(metadata) if metadata else None
+            # 保存metadata为JSON字符串（排除content字段）
+            metadata_json = None
+            if metadata:
+                # 创建metadata副本，排除content字段
+                metadata_clean = {k: v for k, v in metadata.items() if k != 'content'}
+                metadata_json = json.dumps(metadata_clean) if metadata_clean else None
             
             cursor.execute('''
                 INSERT INTO url_records 
@@ -947,11 +997,13 @@ class CrawlerThread(threading.Thread):
             keywords = metadata.get('keywords', '') if metadata else ''
             publish_time = metadata.get('publish_time', '') if metadata else ''
             
-            # 序列化完整的metadata（包括content）
+            # 序列化metadata（排除content字段）
             metadata_json = None
             if metadata:
                 try:
-                    metadata_json = json.dumps(metadata, ensure_ascii=False)
+                    # 创建metadata副本，排除content字段
+                    metadata_clean = {k: v for k, v in metadata.items() if k != 'content'}
+                    metadata_json = json.dumps(metadata_clean, ensure_ascii=False) if metadata_clean else None
                 except Exception as e:
                     logger.warning(f"Failed to serialize metadata for {url}: {e}")
             
@@ -1033,6 +1085,15 @@ class CrawlerThread(threading.Thread):
             conn.commit()
             conn.close()
             self.status = status
+            
+            # 推送任务状态更新
+            if socketio:
+                status_data = {
+                    'task_id': self.task_id,
+                    'status': status,
+                    'timestamp': now
+                }
+                broadcast_task_status(self.task_id, status_data)
         except Exception as e:
             logger.error(f"Failed to update task status: {e}", exc_info=True)
     
@@ -1076,9 +1137,9 @@ class CrawlerThread(threading.Thread):
                     'threads': self.thread_stats
                 }
             
-            # 暂时禁用SocketIO发送，避免AssertionError
-            # 前端将通过轮询API获取监控数据
-            pass
+            # 通过WebSocket推送监控数据
+            if socketio:
+                broadcast_monitor_data(self.task_id, monitor_data)
         except Exception as e:
             logger.error(f"Failed to send monitor data: {e}", exc_info=True)
     
@@ -1099,11 +1160,36 @@ class CrawlerThread(threading.Thread):
         self.update_task_status('running')
         logger.info(f"Task {self.task_id} resumed")
     
+    def pause_queue(self):
+        """暂停URL队列增长"""
+        self.queue_paused = True
+        self._update_queue_status('paused')
+        logger.info(f"Task {self.task_id} queue paused - no new URLs will be discovered")
+    
+    def resume_queue(self):
+        """恢复URL队列增长"""
+        self.queue_paused = False
+        self._update_queue_status('active')
+        logger.info(f"Task {self.task_id} queue resumed - URL discovery enabled")
+    
+    def _update_queue_status(self, status):
+        """更新数据库中的队列状态"""
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('UPDATE tasks SET queue_status = ? WHERE id = ?', (status, self.task_id))
+            conn.commit()
+            conn.close()
+            logger.debug(f"Task {self.task_id} queue status updated to: {status}")
+        except Exception as e:
+            logger.error(f"Failed to update queue status: {e}", exc_info=True)
+    
     def stop(self):
         """停止爬虫"""
         self.stopped = True
         self.manually_stopped = True  # 标记为手动停止
         self.paused = False
+        self.queue_paused = False  # 停止时也重置队列状态
         logger.info(f"Task {self.task_id} stopped manually")
 
 
@@ -1362,6 +1448,14 @@ def start_task(task_id):
             logger.info(f"Restarting task {task_id} - resetting data")
             reset_task_data(task_id)
         
+        # 启动任务时，总是将队列状态设为active
+        conn = db.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('UPDATE tasks SET queue_status = ? WHERE id = ?', ('active', task_id))
+        conn.commit()
+        conn.close()
+        logger.info(f"Task {task_id} queue status set to active")
+        
         # 创建并启动爬虫
         try:
             crawler = CrawlerThread(task_id, task_config, db, socketio)
@@ -1412,9 +1506,59 @@ def resume_task(task_id):
     try:
         with crawler_lock:
             if task_id not in active_crawlers:
-                # 任务不在运行中，需要重新启动
-                logger.info(f"Task {task_id} not in active crawlers, cannot resume")
-                return jsonify({'success': False, 'error': '任务未在运行，请使用重新开始'}), 400
+                # 任务不在运行中，检查是否是暂停状态，如果是则重新启动
+                conn = db.get_connection()
+                cursor = conn.cursor()
+                cursor.execute('SELECT status FROM tasks WHERE id = ?', (task_id,))
+                task = cursor.fetchone()
+                conn.close()
+                
+                if task and task['status'] in ['paused', 'completed', 'stopped', 'failed']:
+                    # 非运行状态的任务，重新启动
+                    logger.info(f"Task {task_id} status is {task['status']}, restarting crawler")
+                    
+                    # 获取任务配置并重新启动
+                    conn = db.get_connection()
+                    cursor = conn.cursor()
+                    cursor.execute('SELECT * FROM tasks WHERE id = ?', (task_id,))
+                    task_data = cursor.fetchone()
+                    conn.close()
+                    
+                    if not task_data:
+                        return jsonify({'success': False, 'error': 'Task not found'}), 404
+                    
+                    task_config = dict(task_data)
+                    
+                    # 如果任务已完成或停止，重置任务数据
+                    if task['status'] in ['completed', 'stopped', 'failed']:
+                        logger.info(f"Resetting task {task_id} data for restart")
+                        reset_task_data(task_id)
+                    
+                    # 创建并启动爬虫
+                    try:
+                        crawler = CrawlerThread(task_id, task_config, db, socketio)
+                        crawler.daemon = True
+                        crawler.start()
+                        
+                        # 添加到活跃爬虫列表
+                        active_crawlers[task_id] = crawler
+                        
+                        # 更新任务状态为运行中，并恢复队列状态
+                        conn = db.get_connection()
+                        cursor = conn.cursor()
+                        cursor.execute('UPDATE tasks SET status = ?, queue_status = ? WHERE id = ?', ('running', 'active', task_id))
+                        conn.commit()
+                        conn.close()
+                        
+                        logger.info(f"Task {task_id} resumed successfully")
+                        return jsonify({'success': True})
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to restart task {task_id}: {e}", exc_info=True)
+                        return jsonify({'success': False, 'error': f'Failed to restart task: {str(e)}'}), 500
+                else:
+                    logger.info(f"Task {task_id} not in active crawlers and not paused, cannot resume")
+                    return jsonify({'success': False, 'error': '任务未在运行，请使用重新开始'}), 400
             
             active_crawlers[task_id].resume()
         
@@ -1422,6 +1566,78 @@ def resume_task(task_id):
     
     except Exception as e:
         logger.error(f"Failed to resume task: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/v1/tasks/<int:task_id>/pause-queue', methods=['POST'])
+def pause_task_queue(task_id):
+    """暂停URL队列增长"""
+    try:
+        logger.info(f"Attempting to pause queue for task {task_id}")
+        
+        # 直接更新数据库中的队列状态
+        conn = db.get_connection()
+        cursor = conn.cursor()
+        
+        # 检查任务是否存在
+        cursor.execute('SELECT id, status FROM tasks WHERE id = ?', (task_id,))
+        task = cursor.fetchone()
+        if not task:
+            conn.close()
+            return jsonify({'success': False, 'error': '任务不存在'}), 404
+        
+        # 更新队列状态
+        cursor.execute('UPDATE tasks SET queue_status = ? WHERE id = ?', ('paused', task_id))
+        conn.commit()
+        conn.close()
+        
+        # 如果任务正在运行，也更新运行时状态
+        with crawler_lock:
+            if task_id in active_crawlers:
+                active_crawlers[task_id].queue_paused = True
+                logger.info(f"Updated running crawler queue status for task {task_id}")
+        
+        logger.info(f"Successfully paused queue for task {task_id}")
+        return jsonify({'success': True})
+    
+    except Exception as e:
+        logger.error(f"Failed to pause queue: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/v1/tasks/<int:task_id>/resume-queue', methods=['POST'])
+def resume_task_queue(task_id):
+    """恢复URL队列增长"""
+    try:
+        logger.info(f"Attempting to resume queue for task {task_id}")
+        
+        # 直接更新数据库中的队列状态
+        conn = db.get_connection()
+        cursor = conn.cursor()
+        
+        # 检查任务是否存在
+        cursor.execute('SELECT id, status FROM tasks WHERE id = ?', (task_id,))
+        task = cursor.fetchone()
+        if not task:
+            conn.close()
+            return jsonify({'success': False, 'error': '任务不存在'}), 404
+        
+        # 更新队列状态
+        cursor.execute('UPDATE tasks SET queue_status = ? WHERE id = ?', ('active', task_id))
+        conn.commit()
+        conn.close()
+        
+        # 如果任务正在运行，也更新运行时状态
+        with crawler_lock:
+            if task_id in active_crawlers:
+                active_crawlers[task_id].queue_paused = False
+                logger.info(f"Updated running crawler queue status for task {task_id}")
+        
+        logger.info(f"Successfully resumed queue for task {task_id}")
+        return jsonify({'success': True})
+    
+    except Exception as e:
+        logger.error(f"Failed to resume queue: {e}", exc_info=True)
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
@@ -1470,6 +1686,7 @@ def get_monitor_data(task_id):
                     monitor_data = {
                         'task_id': task_id,
                         'status': crawler.status,
+                        'queue_status': 'paused' if crawler.queue_paused else 'active',
                         'progress': progress,
                         'total_urls': crawler.total_urls_discovered,
                         'completed_urls': crawler.completed_count,
@@ -1534,6 +1751,7 @@ def get_monitor_data(task_id):
             monitor_data = {
                 'task_id': task_id,
                 'status': task_dict['status'],
+                'queue_status': task_dict.get('queue_status', 'active'),
                 'progress': task_dict['progress'],
                 'total_urls': task_dict['total_urls'],
                 'completed_urls': actual_completed,
@@ -1812,7 +2030,7 @@ def export_task_data(task_id):
 
 @app.route('/api/v1/download', methods=['GET'])
 def download_file():
-    """下载文件 - 优先使用爬虫已下载的内容"""
+    """下载文件 - 直接通过爬虫下载，不使用缓存"""
     try:
         url = request.args.get('url', '')
         task_id = request.args.get('task_id', '')
@@ -1845,123 +2063,53 @@ def download_file():
             logger.warning(f"Failed to parse filename from URL {url}: {e}")
             filename = f'download_{hash(url) % 10000}.html'
         
-        # 首先尝试从数据库获取已爬取的内容
+        # 直接通过爬虫下载，不使用任何缓存
         content = None
         content_type = 'application/octet-stream'
         
-        if task_id:
-            try:
-                conn = db.get_connection()
-                cursor = conn.cursor()
-                
-                # 尝试多种URL格式匹配
-                from urllib.parse import unquote, quote
-                
-                # 原始URL
-                urls_to_try = [url]
-                
-                # 解码后的URL
-                decoded_url = unquote(url)
-                if decoded_url != url:
-                    urls_to_try.append(decoded_url)
-                
-                # 编码后的URL
-                try:
-                    parsed = urlparse(url)
-                    encoded_path = quote(unquote(parsed.path), safe='/')
-                    encoded_url = f"{parsed.scheme}://{parsed.netloc}{encoded_path}"
-                    if encoded_url != url:
-                        urls_to_try.append(encoded_url)
-                except:
-                    pass
-                
-                logger.info(f"Trying to find cached content for URLs: {urls_to_try}")
-                
-                result = None
-                for try_url in urls_to_try:
-                    cursor.execute('''
-                        SELECT content_type, metadata FROM url_records 
-                        WHERE task_id = ? AND url = ? AND status = 'completed'
-                    ''', (task_id, try_url))
-                    result = cursor.fetchone()
-                    if result:
-                        logger.info(f"Found cached content with URL: {try_url}")
-                        break
-                
-                conn.close()
-                
-                if result and result['metadata']:
-                    import json
-                    metadata = json.loads(result['metadata'])
-                    if 'content' in metadata:
-                        cached_content = metadata['content']
-                        content_type = result['content_type'] or 'text/html'
-                        
-                        # 处理不同类型的内容
-                        if 'text/' in content_type or content_type in ['application/json', 'application/javascript']:
-                            # 文本内容直接使用
-                            content = cached_content.encode('utf-8')
-                        else:
-                            # 二进制内容从hex解码
-                            try:
-                                content = bytes.fromhex(cached_content)
-                            except ValueError:
-                                # 如果不是hex，当作文本处理
-                                content = cached_content.encode('utf-8')
-                        
-                        logger.info(f"Using cached content for {url}, size: {len(content)} bytes")
-                    else:
-                        logger.warning(f"No 'content' field in metadata for {url}")
-                else:
-                    logger.warning(f"No cached content found for {url} in task {task_id}")
-            except Exception as e:
-                logger.warning(f"Failed to get cached content for {url}: {e}", exc_info=True)
+        logger.info(f"Downloading fresh content for {url}")
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive'
+        }
         
-        # 如果没有缓存内容，则通过爬虫重新获取
-        if not content:
-            logger.info(f"No cache found, downloading fresh content for {url}")
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                'Accept-Encoding': 'gzip, deflate',
-                'Connection': 'keep-alive'
-            }
+        # 使用会话和重试机制
+        session = requests.Session()
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        
+        try:
+            response = session.get(url, headers=headers, timeout=(10, 30), verify=True, allow_redirects=True)
+            response.raise_for_status()
             
-            # 使用会话和重试机制
-            session = requests.Session()
-            from requests.adapters import HTTPAdapter
-            from urllib3.util.retry import Retry
-            
-            retry_strategy = Retry(
-                total=3,
-                backoff_factor=1,
-                status_forcelist=[429, 500, 502, 503, 504]
-            )
-            adapter = HTTPAdapter(max_retries=retry_strategy)
-            session.mount("http://", adapter)
-            session.mount("https://", adapter)
-            
-            try:
-                response = session.get(url, headers=headers, timeout=(10, 30), verify=True, allow_redirects=True)
-                response.raise_for_status()
-                
-                content = response.content
-                content_type = response.headers.get('Content-Type', 'application/octet-stream')
-                logger.info(f"Successfully downloaded {url}, size: {len(content)} bytes")
-            except requests.exceptions.HTTPError as e:
-                # 如果是404，尝试返回一个简单的错误页面而不是完全失败
-                if e.response.status_code == 404:
-                    logger.warning(f"URL not found (404): {url}")
-                    content = f"<html><body><h1>404 Not Found</h1><p>The requested URL was not found: {url}</p></body></html>".encode('utf-8')
-                    content_type = 'text/html'
-                else:
-                    raise
-            except Exception as e:
-                logger.error(f"Failed to download {url}: {e}")
-                # 返回错误页面而不是抛出异常
-                content = f"<html><body><h1>Download Error</h1><p>Failed to download: {url}</p><p>Error: {str(e)}</p></body></html>".encode('utf-8')
+            content = response.content
+            content_type = response.headers.get('Content-Type', 'application/octet-stream')
+            logger.info(f"Successfully downloaded {url}, size: {len(content)} bytes")
+        except requests.exceptions.HTTPError as e:
+            # 如果是404，尝试返回一个简单的错误页面而不是完全失败
+            if e.response.status_code == 404:
+                logger.warning(f"URL not found (404): {url}")
+                content = f"<html><body><h1>404 Not Found</h1><p>The requested URL was not found: {url}</p></body></html>".encode('utf-8')
                 content_type = 'text/html'
+            else:
+                raise
+        except Exception as e:
+            logger.error(f"Failed to download {url}: {e}")
+            # 返回错误页面而不是抛出异常
+            content = f"<html><body><h1>Download Error</h1><p>Failed to download: {url}</p><p>Error: {str(e)}</p></body></html>".encode('utf-8')
+            content_type = 'text/html'
         
         # 创建响应，正确处理中文文件名
         from flask import Response
@@ -2067,13 +2215,47 @@ def get_task_analysis(task_id):
 
 # 静态文件路由已在前面定义，这里删除重复定义
 
-# WebSocket事件
+# WebSocket事件处理器
+@socketio.on('connect')
+def handle_connect():
+    """客户端连接事件"""
+    logger.info(f"Client connected: {request.sid}")
+    emit('connected', {'message': 'WebSocket连接成功'})
 
-# 所有SocketIO事件处理器已禁用
+@socketio.on('disconnect')
+def handle_disconnect():
+    """客户端断开连接事件"""
+    logger.info(f"Client disconnected: {request.sid}")
+
+@socketio.on('join_task')
+def handle_join_task(data):
+    """客户端加入任务监控房间"""
+    task_id = data.get('task_id')
+    if task_id:
+        join_room(f'task_{task_id}')
+        logger.info(f"Client {request.sid} joined task {task_id} room")
+        emit('joined_task', {'task_id': task_id})
+
+@socketio.on('leave_task')
+def handle_leave_task(data):
+    """客户端离开任务监控房间"""
+    task_id = data.get('task_id')
+    if task_id:
+        leave_room(f'task_{task_id}')
+        logger.info(f"Client {request.sid} left task {task_id} room")
+
+def broadcast_monitor_data(task_id, monitor_data):
+    """广播监控数据到指定任务房间"""
+    socketio.emit('monitor_update', monitor_data, room=f'task_{task_id}')
+
+def broadcast_task_status(task_id, status_data):
+    """广播任务状态变更"""
+    socketio.emit('task_status_update', status_data, room=f'task_{task_id}')
 
 
 if __name__ == '__main__':
     logger.info("Starting Intelligent Web Crawler System...")
     logger.info("Server running on http://localhost:8000")
-    # 使用标准Flask运行，避免SocketIO相关错误
-    app.run(host='0.0.0.0', port=8000, debug=False, threaded=True)
+    logger.info("WebSocket enabled for real-time communication")
+    # 使用SocketIO运行，支持WebSocket连接
+    socketio.run(app, host='0.0.0.0', port=8000, debug=False)

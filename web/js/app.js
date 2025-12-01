@@ -1,4 +1,4 @@
-// 智能网络爬虫系统 - 前端应用
+// 网络爬虫系统 - 前端应用
 
 // 全局变量
 let socket = null;
@@ -87,25 +87,79 @@ function updateConnectionStatus(connected) {
     }
 }
 
-// ==================== HTTP轮询 ====================
+// ==================== WebSocket连接 ====================
+
+function initializeWebSocket() {
+    console.log('Initializing WebSocket connection...');
+    
+    // 连接到Socket.IO服务器
+    socket = io(API_BASE);
+    
+    // 连接成功事件
+    socket.on('connect', () => {
+        console.log('WebSocket connected successfully');
+        addLog('WebSocket连接成功', 'success');
+        
+        // 如果有当前任务，加入监控房间
+        if (currentTaskId) {
+            joinTaskRoom(currentTaskId);
+        }
+    });
+    
+    // 连接断开事件
+    socket.on('disconnect', () => {
+        console.log('WebSocket disconnected');
+        addLog('WebSocket连接断开', 'warning');
+    });
+    
+    // 监控数据更新事件
+    socket.on('monitor_update', (data) => {
+        console.log('Received monitor update:', data);
+        updateMonitorDisplay(data);
+    });
+    
+    // 任务状态更新事件
+    socket.on('task_status_update', (data) => {
+        console.log('Received task status update:', data);
+        // 更新任务列表中的状态
+        loadTasks();
+    });
+    
+    // 加入任务房间确认
+    socket.on('joined_task', (data) => {
+        console.log(`Joined task ${data.task_id} room`);
+        addLog(`开始监控任务 ${data.task_id}`, 'info');
+    });
+    
+    // 连接错误处理
+    socket.on('connect_error', (error) => {
+        console.error('WebSocket connection error:', error);
+        addLog('WebSocket连接失败', 'error');
+    });
+}
+
+function joinTaskRoom(taskId) {
+    if (socket && socket.connected) {
+        socket.emit('join_task', { task_id: taskId });
+    }
+}
+
+function leaveTaskRoom(taskId) {
+    if (socket && socket.connected) {
+        socket.emit('leave_task', { task_id: taskId });
+    }
+}
+
+// ==================== HTTP轮询 (备用) ====================
 
 function startPolling() {
-    if (pollingInterval) {
-        clearInterval(pollingInterval);
-    }
-    
-    pollingInterval = setInterval(() => {
-        if (currentTaskId) {
-            fetchMonitorData(currentTaskId);
-        }
-    }, 2000);
+    // WebSocket模式下不使用HTTP轮询
+    console.log('WebSocket mode: HTTP polling disabled');
 }
 
 function stopPolling() {
-    if (pollingInterval) {
-        clearInterval(pollingInterval);
-        pollingInterval = null;
-    }
+    // WebSocket模式下不需要停止轮询
+    console.log('WebSocket mode: No polling to stop');
 }
 
 async function fetchMonitorData(taskId) {
@@ -241,6 +295,11 @@ function selectTask(taskId) {
         taskExpandedNodes[currentTaskId] = new Set(expandedNodes);
     }
     
+    // 离开当前任务的WebSocket房间
+    if (currentTaskId && currentTaskId !== taskId) {
+        leaveTaskRoom(currentTaskId);
+    }
+    
     currentTaskId = taskId;
     const task = tasks.find(t => t.id === taskId);
     
@@ -252,10 +311,11 @@ function selectTask(taskId) {
         // 显示编辑按钮
         document.getElementById('btnEditTask').style.display = 'inline-flex';
         
-        updateControlButtons(task.status);
+        updateControlButtons(task.status, task.queue_status);
         renderTaskList();
         
-        // 使用HTTP轮询，不需要SocketIO订阅
+        // 加入新任务的WebSocket房间
+        joinTaskRoom(taskId);
         
         // 切换任务时重置流量图表
         resetTrafficChart(taskId);
@@ -285,17 +345,24 @@ function selectTask(taskId) {
     }
 }
 
-function updateControlButtons(status) {
+function updateControlButtons(status, queueStatus = 'active') {
     const btnStart = document.getElementById('btnStart');
-    const btnPause = document.getElementById('btnPause');
-    const btnResume = document.getElementById('btnResume');
+    const btnPauseCrawling = document.getElementById('btnPauseCrawling');
+    const btnResumeCrawling = document.getElementById('btnResumeCrawling');
+    const btnPauseQueue = document.getElementById('btnPauseQueue');
+    const btnResumeQueue = document.getElementById('btnResumeQueue');
     const btnStop = document.getElementById('btnStop');
     
     // 重置所有按钮
     btnStart.disabled = false;
-    btnPause.disabled = true;
-    btnResume.disabled = true;
+    btnPauseCrawling.disabled = true;
+    btnResumeCrawling.disabled = true;
+    btnPauseQueue.disabled = true;
+    btnResumeQueue.disabled = true;
     btnStop.disabled = true;
+    
+    // 队列控制按钮始终可用（除了pending状态）
+    const queueControlsEnabled = status !== 'pending';
     
     switch (status) {
         case 'pending':
@@ -306,22 +373,46 @@ function updateControlButtons(status) {
         case 'failed':
             btnStart.disabled = false;
             btnStart.innerHTML = '<i class="fas fa-redo"></i> 重启';
+            // 队列控制可用
+            if (queueStatus === 'paused') {
+                btnResumeQueue.disabled = false;
+            } else {
+                btnPauseQueue.disabled = false;
+            }
             break;
         case 'completed':
             btnStart.disabled = false;
             btnStart.innerHTML = '<i class="fas fa-redo"></i> 重新开始';
+            // 队列控制可用
+            if (queueStatus === 'paused') {
+                btnResumeQueue.disabled = false;
+            } else {
+                btnPauseQueue.disabled = false;
+            }
             break;
         case 'running':
             btnStart.disabled = true;
             btnStart.innerHTML = '<i class="fas fa-play"></i> 开始';
-            btnPause.disabled = false;
+            btnPauseCrawling.disabled = false;
             btnStop.disabled = false;
+            // 队列控制基于队列状态
+            if (queueStatus === 'paused') {
+                btnResumeQueue.disabled = false;
+            } else {
+                btnPauseQueue.disabled = false;
+            }
             break;
         case 'paused':
             btnStart.disabled = true;
             btnStart.innerHTML = '<i class="fas fa-play"></i> 开始';
-            btnResume.disabled = false;
+            btnResumeCrawling.disabled = false;
             btnStop.disabled = false;
+            // 队列控制基于队列状态
+            if (queueStatus === 'paused') {
+                btnResumeQueue.disabled = false;
+            } else {
+                btnPauseQueue.disabled = false;
+            }
             break;
     }
 }
@@ -376,7 +467,7 @@ async function startTask() {
     }
 }
 
-async function pauseTask() {
+async function pauseCrawling() {
     if (!currentTaskId) return;
     
     try {
@@ -386,7 +477,7 @@ async function pauseTask() {
         const result = await response.json();
         
         if (result.success) {
-            addLog('任务已暂停，停止刷新', 'info');
+            addLog('爬取已暂停，停止刷新', 'info');
             stopPolling();  // 立即停止轮询
             await loadTasks();
             // 更新UI但不重新选择任务（避免重新启动轮询）
@@ -394,19 +485,19 @@ async function pauseTask() {
             if (task) {
                 document.getElementById('currentTaskStatus').textContent = getStatusText(task.status);
                 document.getElementById('currentTaskStatus').className = `task-status status-${task.status}`;
-                updateControlButtons(task.status);
+                updateControlButtons(task.status, task.queue_status);
                 renderTaskList();
             }
         } else {
-            addLog(`暂停失败: ${result.error}`, 'error');
+            addLog(`爬取暂停失败: ${result.error}`, 'error');
         }
     } catch (error) {
-        console.error('Failed to pause task:', error);
-        addLog('暂停任务失败', 'error');
+        console.error('Failed to pause crawling:', error);
+        addLog('爬取暂停失败', 'error');
     }
 }
 
-async function resumeTask() {
+async function resumeCrawling() {
     if (!currentTaskId) return;
     
     try {
@@ -416,16 +507,16 @@ async function resumeTask() {
         const result = await response.json();
         
         if (result.success) {
-            addLog('任务已继续', 'success');
+            addLog('爬取已继续', 'success');
             startPolling();
             await loadTasks();
             selectTask(currentTaskId);
         } else {
-            addLog(`继续失败: ${result.error}`, 'error');
+            addLog(`爬取继续失败: ${result.error}`, 'error');
         }
     } catch (error) {
-        console.error('Failed to resume task:', error);
-        addLog('继续任务失败', 'error');
+        console.error('Failed to resume crawling:', error);
+        addLog('爬取继续失败', 'error');
     }
 }
 
@@ -442,12 +533,12 @@ async function stopTask() {
             addLog('任务已停止，停止刷新', 'warning');
             stopPolling();  // 立即停止轮询
             await loadTasks();
-            // 更新UI但不重新选择任务（避免重新启动轮询）
+            await loadTasks();
             const task = tasks.find(t => t.id === currentTaskId);
             if (task) {
                 document.getElementById('currentTaskStatus').textContent = getStatusText(task.status);
                 document.getElementById('currentTaskStatus').className = `task-status status-${task.status}`;
-                updateControlButtons(task.status);
+                updateControlButtons(task.status, task.queue_status);
                 renderTaskList();
             }
         } else {
@@ -456,6 +547,58 @@ async function stopTask() {
     } catch (error) {
         console.error('Failed to stop task:', error);
         addLog('停止任务失败', 'error');
+    }
+}
+
+async function pauseQueue() {
+    if (!currentTaskId) return;
+    
+    try {
+        const response = await fetch(`${API_BASE}/api/v1/tasks/${currentTaskId}/pause-queue`, {
+            method: 'POST'
+        });
+        const result = await response.json();
+        
+        if (result.success) {
+            addLog('URL队列已暂停，停止发现新链接', 'info');
+            await loadTasks();
+            const task = tasks.find(t => t.id === currentTaskId);
+            if (task) {
+                updateControlButtons(task.status, task.queue_status);
+                renderTaskList();
+            }
+        } else {
+            addLog(`队列暂停失败: ${result.error}`, 'error');
+        }
+    } catch (error) {
+        console.error('Failed to pause queue:', error);
+        addLog('队列暂停失败', 'error');
+    }
+}
+
+async function resumeQueue() {
+    if (!currentTaskId) return;
+    
+    try {
+        const response = await fetch(`${API_BASE}/api/v1/tasks/${currentTaskId}/resume-queue`, {
+            method: 'POST'
+        });
+        const result = await response.json();
+        
+        if (result.success) {
+            addLog('URL队列已继续，恢复发现新链接', 'success');
+            await loadTasks();
+            const task = tasks.find(t => t.id === currentTaskId);
+            if (task) {
+                updateControlButtons(task.status, task.queue_status);
+                renderTaskList();
+            }
+        } else {
+            addLog(`队列继续失败: ${result.error}`, 'error');
+        }
+    } catch (error) {
+        console.error('Failed to resume queue:', error);
+        addLog('队列继续失败', 'error');
     }
 }
 
@@ -777,7 +920,7 @@ function updateMonitorDisplay(data) {
         document.getElementById('currentTaskStatus').textContent = getStatusText(data.status);
         document.getElementById('currentTaskStatus').className = `task-status status-${data.status}`;
         
-        updateControlButtons(data.status);
+        updateControlButtons(data.status, data.queue_status);
         renderTaskList();
         
         // 如果任务完成或停止，添加日志（避免重复）并停止轮询
@@ -1302,9 +1445,11 @@ function buildUrlTree(urls) {
             if (pathParts.length === 0) {
                 tree[domain].urls.push(urlData);
             } else {
-                // 按路径层级组织
+                // 按路径层级组织，为每个路径部分创建文件夹
                 let current = tree[domain].children;
-                for (let i = 0; i < pathParts.length - 1; i++) {
+                
+                // 为所有路径部分创建文件夹结构
+                for (let i = 0; i < pathParts.length; i++) {
                     const part = pathParts[i];
                     if (!current[part]) {
                         current[part] = {
@@ -1314,19 +1459,15 @@ function buildUrlTree(urls) {
                             urls: []
                         };
                     }
-                    current = current[part].children;
+                    
+                    // 如果是最后一个路径部分，将URL添加到该文件夹
+                    if (i === pathParts.length - 1) {
+                        current[part].urls.push(urlData);
+                    } else {
+                        // 否则继续深入下一级
+                        current = current[part].children;
+                    }
                 }
-                
-                // 最后一部分是文件名
-                const fileName = pathParts[pathParts.length - 1] || 'index';
-                if (!current[fileName]) {
-                    current[fileName] = {
-                        type: 'file',
-                        name: fileName,
-                        urls: []
-                    };
-                }
-                current[fileName].urls.push(urlData);
             }
         } catch (e) {
             // URL解析失败，放在根目录
