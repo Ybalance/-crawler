@@ -350,7 +350,6 @@ function updateControlButtons(status, queueStatus = 'active') {
     const btnPauseCrawling = document.getElementById('btnPauseCrawling');
     const btnResumeCrawling = document.getElementById('btnResumeCrawling');
     const btnPauseQueue = document.getElementById('btnPauseQueue');
-    const btnResumeQueue = document.getElementById('btnResumeQueue');
     const btnStop = document.getElementById('btnStop');
     
     // 重置所有按钮
@@ -358,7 +357,6 @@ function updateControlButtons(status, queueStatus = 'active') {
     btnPauseCrawling.disabled = true;
     btnResumeCrawling.disabled = true;
     btnPauseQueue.disabled = true;
-    btnResumeQueue.disabled = true;
     btnStop.disabled = true;
     
     // 队列控制按钮始终可用（除了pending状态）
@@ -374,21 +372,13 @@ function updateControlButtons(status, queueStatus = 'active') {
             btnStart.disabled = false;
             btnStart.innerHTML = '<i class="fas fa-redo"></i> 重启';
             // 队列控制可用
-            if (queueStatus === 'paused') {
-                btnResumeQueue.disabled = false;
-            } else {
-                btnPauseQueue.disabled = false;
-            }
+            btnPauseQueue.disabled = queueStatus === 'paused';
             break;
         case 'completed':
             btnStart.disabled = false;
             btnStart.innerHTML = '<i class="fas fa-redo"></i> 重新开始';
             // 队列控制可用
-            if (queueStatus === 'paused') {
-                btnResumeQueue.disabled = false;
-            } else {
-                btnPauseQueue.disabled = false;
-            }
+            btnPauseQueue.disabled = queueStatus === 'paused';
             break;
         case 'running':
             btnStart.disabled = true;
@@ -396,11 +386,7 @@ function updateControlButtons(status, queueStatus = 'active') {
             btnPauseCrawling.disabled = false;
             btnStop.disabled = false;
             // 队列控制基于队列状态
-            if (queueStatus === 'paused') {
-                btnResumeQueue.disabled = false;
-            } else {
-                btnPauseQueue.disabled = false;
-            }
+            btnPauseQueue.disabled = queueStatus === 'paused';
             break;
         case 'paused':
             btnStart.disabled = true;
@@ -408,11 +394,7 @@ function updateControlButtons(status, queueStatus = 'active') {
             btnResumeCrawling.disabled = false;
             btnStop.disabled = false;
             // 队列控制基于队列状态
-            if (queueStatus === 'paused') {
-                btnResumeQueue.disabled = false;
-            } else {
-                btnPauseQueue.disabled = false;
-            }
+            btnPauseQueue.disabled = queueStatus === 'paused';
             break;
     }
 }
@@ -560,45 +542,23 @@ async function pauseQueue() {
         const result = await response.json();
         
         if (result.success) {
-            addLog('URL队列已暂停，停止发现新链接', 'info');
-            await loadTasks();
+            addLog('URL队列已停止，停止发现新链接', 'info');
             const task = tasks.find(t => t.id === currentTaskId);
             if (task) {
-                updateControlButtons(task.status, task.queue_status);
+                // 更新本地任务对象的队列状态
+                task.queue_status = 'paused';
+                // 直接设置队列状态为'paused'，确保按钮状态正确更新
+                updateControlButtons(task.status, 'paused');
                 renderTaskList();
             }
+            // 重新加载任务列表以确保数据同步
+            await loadTasks();
         } else {
-            addLog(`队列暂停失败: ${result.error}`, 'error');
+            addLog(`队列停止失败: ${result.error}`, 'error');
         }
     } catch (error) {
         console.error('Failed to pause queue:', error);
-        addLog('队列暂停失败', 'error');
-    }
-}
-
-async function resumeQueue() {
-    if (!currentTaskId) return;
-    
-    try {
-        const response = await fetch(`${API_BASE}/api/v1/tasks/${currentTaskId}/resume-queue`, {
-            method: 'POST'
-        });
-        const result = await response.json();
-        
-        if (result.success) {
-            addLog('URL队列已继续，恢复发现新链接', 'success');
-            await loadTasks();
-            const task = tasks.find(t => t.id === currentTaskId);
-            if (task) {
-                updateControlButtons(task.status, task.queue_status);
-                renderTaskList();
-            }
-        } else {
-            addLog(`队列继续失败: ${result.error}`, 'error');
-        }
-    } catch (error) {
-        console.error('Failed to resume queue:', error);
-        addLog('队列继续失败', 'error');
+        addLog('队列停止失败', 'error');
     }
 }
 
@@ -666,11 +626,10 @@ async function createTask(event) {
     
     const form = event.target;
     const formData = new FormData(form);
+    const createBothStrategies = formData.get('create_both_strategies') === 'on';
     
-    const taskData = {
-        name: formData.get('name'),
+    const baseTaskData = {
         url: formData.get('url'),
-        strategy: formData.get('strategy'),
         max_depth: parseInt(formData.get('max_depth')),
         thread_count: parseInt(formData.get('thread_count')),
         request_interval: parseFloat(formData.get('request_interval')),
@@ -680,22 +639,97 @@ async function createTask(event) {
     };
     
     try {
-        const response = await fetch(`${API_BASE}/api/v1/tasks`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(taskData)
-        });
-        const result = await response.json();
-        
-        if (result.success) {
-            addLog(`任务创建成功: ${taskData.name}`, 'success');
-            closeCreateTaskModal();
-            await loadTasks();
-            selectTask(result.data.id);
+        if (createBothStrategies) {
+            // 创建BFS任务
+            const bfsTaskData = {
+                ...baseTaskData,
+                name: `${formData.get('name')}_BFS`,
+                strategy: 'bfs'
+            };
+            
+            const bfsResponse = await fetch(`${API_BASE}/api/v1/tasks`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(bfsTaskData)
+            });
+            const bfsResult = await bfsResponse.json();
+            
+            if (bfsResult.success) {
+                addLog(`BFS任务创建成功: ${bfsTaskData.name}`, 'success');
+            } else {
+                addLog(`BFS任务创建失败: ${bfsResult.error}`, 'error');
+            }
+            
+            // 创建DFS任务
+            const dfsTaskData = {
+                ...baseTaskData,
+                name: `${formData.get('name')}_DFS`,
+                strategy: 'dfs'
+            };
+            
+            const dfsResponse = await fetch(`${API_BASE}/api/v1/tasks`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(dfsTaskData)
+            });
+            const dfsResult = await dfsResponse.json();
+            
+            if (dfsResult.success) {
+                addLog(`DFS任务创建成功: ${dfsTaskData.name}`, 'success');
+            } else {
+                addLog(`DFS任务创建失败: ${dfsResult.error}`, 'error');
+            }
+            
+            // 如果两个任务都创建成功，则启动它们
+            if (bfsResult.success && dfsResult.success) {
+                addLog('正在启动两个任务进行对比...', 'info');
+                
+                // 启动BFS任务
+                await fetch(`${API_BASE}/api/v1/tasks/${bfsResult.data.id}/start`, {
+                    method: 'POST'
+                });
+                
+                // 启动DFS任务
+                await fetch(`${API_BASE}/api/v1/tasks/${dfsResult.data.id}/start`, {
+                    method: 'POST'
+                });
+                
+                addLog('两个任务已成功启动，开始对比爬取效果...', 'success');
+            }
         } else {
-            addLog(`创建失败: ${result.error}`, 'error');
+            // 只创建一个任务（原有逻辑）
+            const taskData = {
+                ...baseTaskData,
+                name: formData.get('name'),
+                strategy: formData.get('strategy')
+            };
+            
+            const response = await fetch(`${API_BASE}/api/v1/tasks`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(taskData)
+            });
+            const result = await response.json();
+            
+            if (result.success) {
+                addLog(`任务创建成功: ${taskData.name}`, 'success');
+            } else {
+                addLog(`创建失败: ${result.error}`, 'error');
+            }
+        }
+        
+        closeCreateTaskModal();
+        await loadTasks();
+        
+        // 如果只创建了一个任务，则选择它
+        if (!createBothStrategies && result?.success) {
+            selectTask(result.data.id);
         }
     } catch (error) {
         console.error('Failed to create task:', error);
@@ -2827,6 +2861,64 @@ function initNewCharts() {
         });
     }
     
+    // 热度分析图表
+    const popularityCtx = document.getElementById('popularityChart');
+    if (popularityCtx) {
+        window.popularityChart = new Chart(popularityCtx, {
+            type: 'bar',
+            data: {
+                labels: ['0-100', '100-1k', '1k-1万', '1万-10万', '10万+'],
+                datasets: [{
+                    label: 'URL数量',
+                    data: [0, 0, 0, 0, 0],
+                    backgroundColor: [
+                        'rgba(255, 193, 7, 0.8)',
+                        'rgba(255, 152, 0, 0.8)',
+                        'rgba(255, 87, 34, 0.8)',
+                        'rgba(244, 67, 54, 0.8)',
+                        'rgba(156, 39, 176, 0.8)'
+                    ],
+                    borderColor: [
+                        'rgba(255, 193, 7, 1)',
+                        'rgba(255, 152, 0, 1)',
+                        'rgba(255, 87, 34, 1)',
+                        'rgba(244, 67, 54, 1)',
+                        'rgba(156, 39, 176, 1)'
+                    ],
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        display: false
+                    },
+                    title: {
+                        display: true,
+                        text: '热度分数分布'
+                    }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        title: {
+                            display: true,
+                            text: 'URL数量'
+                        }
+                    },
+                    x: {
+                        title: {
+                            display: true,
+                            text: '热度分数范围'
+                        }
+                    }
+                }
+            }
+        });
+    }
+    
 }
 
 // 更新数据分析图表
@@ -2859,6 +2951,18 @@ async function updateAnalysisCharts() {
                 window.responseTimeChart.update();
             }
             
+            // 更新热度分析图表
+            if (window.popularityChart && data.popularity_distribution) {
+                window.popularityChart.data.labels = data.popularity_distribution.map(d => d.range);
+                window.popularityChart.data.datasets[0].data = data.popularity_distribution.map(d => d.count);
+                window.popularityChart.update();
+            }
+            
+            // 更新热度排行榜
+            if (data.top_popular_urls) {
+                updatePopularityRanking(data.top_popular_urls);
+            }
+            
         }
     } catch (error) {
         console.error('Failed to update analysis charts:', error);
@@ -2874,4 +2978,58 @@ function refreshAnalysisCharts() {
     
     addLog('正在刷新数据分析...', 'info');
     updateAnalysisCharts();
+}
+
+// 更新热度排行榜
+function updatePopularityRanking(topUrls) {
+    const container = document.getElementById('popularityRanking');
+    
+    if (!topUrls || topUrls.length === 0) {
+        container.innerHTML = `
+            <div class="empty-state">
+                <i class="fas fa-chart-bar"></i>
+                <p>暂无热度数据</p>
+            </div>
+        `;
+        return;
+    }
+    
+    const html = topUrls.map((item, index) => {
+        const rank = index + 1;
+        const rankClass = rank <= 3 ? `top-${rank}` : '';
+        
+        // 格式化数字显示
+        const formatNumber = (num) => {
+            if (num >= 10000) return (num / 10000).toFixed(1) + '万';
+            if (num >= 1000) return (num / 1000).toFixed(1) + 'k';
+            return num.toString();
+        };
+        
+        // 截断URL显示
+        const displayUrl = item.url.length > 60 ? item.url.substring(0, 60) + '...' : item.url;
+        const displayTitle = item.title && item.title.length > 40 ? item.title.substring(0, 40) + '...' : (item.title || '无标题');
+        
+        return `
+            <div class="popularity-item">
+                <div class="popularity-rank ${rankClass}">${rank}</div>
+                <div class="popularity-info">
+                    <div class="popularity-url" title="${item.url}">${displayUrl}</div>
+                    <div class="popularity-title" title="${item.title || '无标题'}">${displayTitle}</div>
+                    <div class="popularity-stats">
+                        <div class="popularity-stat">
+                            <i class="fas fa-eye"></i>
+                            <span>${formatNumber(item.view_count || 0)}</span>
+                        </div>
+                        <div class="popularity-stat">
+                            <i class="fas fa-thumbs-up"></i>
+                            <span>${formatNumber(item.like_count || 0)}</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="popularity-score">${formatNumber(item.popularity_score || 0)}</div>
+            </div>
+        `;
+    }).join('');
+    
+    container.innerHTML = html;
 }

@@ -175,6 +175,39 @@ class Database:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_task_id ON url_records(task_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_url_status ON url_records(status)')
         
+        # 清理重复的URL记录（在创建唯一索引之前）
+        try:
+            # 删除重复的URL，保留最新的记录（id最大的）
+            cursor.execute('''
+                DELETE FROM url_records 
+                WHERE id NOT IN (
+                    SELECT MAX(id) 
+                    FROM url_records 
+                    GROUP BY task_id, url
+                )
+            ''')
+            deleted_count = cursor.rowcount
+            if deleted_count > 0:
+                logger.info(f"Cleaned up {deleted_count} duplicate URL records")
+        except Exception as e:
+            logger.warning(f"Failed to clean up duplicate records: {e}")
+        
+        # 创建唯一索引，防止同一任务中的URL重复
+        try:
+            cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_task_url_unique ON url_records(task_id, url)')
+        except Exception as e:
+            # 如果索引创建失败（可能还有重复），强制删除重复后再创建
+            logger.warning(f"Failed to create unique index, attempting cleanup: {e}")
+            cursor.execute('''
+                DELETE FROM url_records 
+                WHERE id NOT IN (
+                    SELECT MAX(id) 
+                    FROM url_records 
+                    GROUP BY task_id, url
+                )
+            ''')
+            cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_task_url_unique ON url_records(task_id, url)')
+        
         conn.commit()
         conn.close()
     
@@ -429,6 +462,11 @@ class CrawlerThread(threading.Thread):
         parsed = urlparse(url)
         path = parsed.path
         
+        # 统一协议：将http和https都标准化为https
+        scheme = parsed.scheme.lower()
+        if scheme == 'http':
+            scheme = 'https'
+        
         # 如果路径为空或只有斜杠，统一为带斜杠
         if path == '' or path == '/':
             path = '/'
@@ -437,7 +475,7 @@ class CrawlerThread(threading.Thread):
             path = path.rstrip('/')
         
         # 重建URL
-        url = f"{parsed.scheme}://{parsed.netloc}{path}"
+        url = f"{scheme}://{parsed.netloc}{path}"
         if parsed.query:
             url += f"?{parsed.query}"
         
@@ -596,12 +634,16 @@ class CrawlerThread(threading.Thread):
     
     def crawl_url(self, url: str, depth: int, thread_id: int) -> bool:
         """爬取单个URL"""
+        original_url = url
         url = self.normalize_url(url)
         
         # 检查是否已经处理过（防止重复处理）
         with self.queue_lock:
             if url in self.visited_urls:
                 logger.debug(f"URL already visited, skipping: {url}")
+                # 更新原始URL的状态为completed（避免pending残留）
+                if original_url != url:
+                    self.update_url_record(original_url, 'completed', 200, 0, 0, 'text/html', 'Duplicate (redirected or normalized)')
                 return None  # 返回None表示跳过，不计入统计
             self.visited_urls.add(url)
         
@@ -644,6 +686,10 @@ class CrawlerThread(threading.Thread):
                 )
                 response_time = time.time() - start_time
                 
+                # 获取响应信息
+                status_code = response.status_code
+                content_type = response.headers.get('Content-Type', '').split(';')[0].strip()
+                
                 # 检查是否发生重定向
                 final_url = CrawlerThread.normalize_url(response.url)
                 if final_url != url:
@@ -652,9 +698,8 @@ class CrawlerThread(threading.Thread):
                     with self.queue_lock:
                         self.visited_urls.add(final_url)
                         self.queued_urls.add(final_url)
-                
-                status_code = response.status_code
-                content_type = response.headers.get('Content-Type', '').split(';')[0].strip()
+                    # 更新原始URL为completed状态（重定向也算完成）
+                    self.update_url_record(url, 'completed', status_code, response_time, 0, content_type, f'Redirected to {final_url}')
                 
                 # 获取文件大小
                 file_size = 0
@@ -684,8 +729,10 @@ class CrawlerThread(threading.Thread):
                     try:
                         html = content.decode('utf-8', errors='ignore')
                         metadata = self.extract_metadata(html)
+                        # 获取当前页面的热度分数，用于子链接优先级计算
+                        parent_popularity = metadata.get('popularity_score', 0)
                         # 不再保存内容到数据库，下载时直接重新获取
-                        self.extract_links(url, html, depth)
+                        self.extract_links(url, html, depth, parent_popularity)
                     except Exception as e:
                         logger.warning(f"Failed to extract content from {url}: {e}")
                 # 不再缓存任何文件内容到数据库
@@ -750,7 +797,10 @@ class CrawlerThread(threading.Thread):
             'author': '',
             'description': '',
             'keywords': '',
-            'publish_time': ''
+            'publish_time': '',
+            'popularity_score': 0,  # 热度分数
+            'view_count': 0,        # 浏览量
+            'like_count': 0         # 点赞数
         }
         
         try:
@@ -815,13 +865,105 @@ class CrawlerThread(threading.Thread):
             if date_meta and date_meta.get('content') and not metadata['publish_time']:
                 metadata['publish_time'] = date_meta['content'].strip()[:50]
             
+            # 提取热度相关信息
+            # 1. 浏览量/播放量 (更全面的选择器)
+            view_selectors = [
+                # B站相关
+                '.view', '.view-text', '.play-count', '.play-num', '.video-view',
+                '[data-v-*] .view', '.info .view', '.stats .view',
+                # 通用选择器
+                '.view-count', '.views', '.播放量', '.浏览量', '.观看',
+                '[data-view-count]', '[data-play-count]', 
+                '.stat-view', '.count-view', '.view-num',
+                # 文本匹配
+                '*[class*="view"]', '*[class*="play"]', '*[class*="watch"]'
+            ]
+            for selector in view_selectors:
+                view_elem = soup.select_one(selector)
+                if view_elem:
+                    view_text = view_elem.get_text().strip()
+                    view_num = self.extract_number(view_text)
+                    if view_num > 0:
+                        metadata['view_count'] = view_num
+                        break
+            
+            # 2. 点赞数 (扩展B站选择器)
+            like_selectors = [
+                # B站相关
+                '.like', '.like-info', '.ops .like', '.video-like', 
+                '[data-v-*] .like', '.info .like', '.stats .like',
+                # 通用选择器
+                '.like-count', '.likes', '.点赞', '.thumb-up', '.好评', '.赞',
+                '[data-like-count]', '.stat-like', '.count-like', '.like-num',
+                # 文本匹配
+                '*[class*="like"]', '*[class*="thumb"]', '*[class*="praise"]'
+            ]
+            for selector in like_selectors:
+                like_elem = soup.select_one(selector)
+                if like_elem:
+                    like_text = like_elem.get_text().strip()
+                    like_num = self.extract_number(like_text)
+                    if like_num > 0:
+                        metadata['like_count'] = like_num
+                        break
+            
+            # 计算综合热度分数 (移除评论/转发，简化为浏览+点赞)
+            metadata['popularity_score'] = (
+                metadata['view_count'] * 1 +      # 浏览量权重1
+                metadata['like_count'] * 10       # 点赞权重10
+            )
+            
         except Exception as e:
             logger.warning(f"Failed to extract metadata: {e}")
         
         return metadata
     
-    def extract_links(self, base_url: str, html: str, depth: int):
-        """提取页面中的链接"""
+    def extract_number(self, text: str) -> int:
+        """从文本中提取数字，支持万、千等单位"""
+        import re
+        
+        # 先尝试提取包含数字的部分
+        number_pattern = r'[\d.,]+[万千kwKW]?'
+        matches = re.findall(number_pattern, text)
+        
+        if not matches:
+            # 如果没有找到，尝试提取纯数字
+            pure_numbers = re.findall(r'\d+', text)
+            if pure_numbers:
+                try:
+                    return int(pure_numbers[0])
+                except:
+                    return 0
+            return 0
+        
+        # 取第一个匹配的数字
+        number_text = matches[0]
+        
+        try:
+            # 移除逗号
+            number_text = number_text.replace(',', '')
+            
+            # 处理万、千等单位
+            if '万' in number_text or 'w' in number_text.lower():
+                num_str = re.sub(r'[万wW]', '', number_text)
+                return int(float(num_str) * 10000)
+            elif '千' in number_text or 'k' in number_text.lower():
+                num_str = re.sub(r'[千kK]', '', number_text)
+                return int(float(num_str) * 1000)
+            else:
+                return int(float(number_text))
+        except:
+            return 0
+    
+    def extract_links(self, base_url: str, html: str, depth: int, parent_popularity: int = 0):
+        """提取页面中的链接
+        
+        Args:
+            base_url: 当前页面URL
+            html: 页面HTML内容
+            depth: 当前页面深度
+            parent_popularity: 父页面的热度分数，用于计算子链接优先级
+        """
         # 如果队列暂停，不提取新链接
         if self.queue_paused:
             logger.info(f"Queue is paused, skipping link extraction for {base_url}")
@@ -907,6 +1049,12 @@ class CrawlerThread(threading.Thread):
                                 priority = 1
                             else:
                                 priority = 2
+                        elif strategy == 'popularity':
+                            # 热度优先：基于父页面热度计算子链接优先级
+                            # 优先级 = -(父页面热度 - 深度惩罚)
+                            # 热度越高、深度越浅的链接优先级越高（PriorityQueue中数值越小优先级越高）
+                            depth_penalty = next_depth * 1000  # 每增加一层深度，降低1000分优先级
+                            priority = -(parent_popularity - depth_penalty)
                         else:  # bfs
                             priority = next_depth  # 广度优先：深度越小优先级越高
                         
@@ -946,6 +1094,9 @@ class CrawlerThread(threading.Thread):
                        error_message: str, metadata: dict = None):
         """保存URL记录到数据库"""
         try:
+            # 关键修复：先规范化URL再保存，确保http和https统一
+            url = self.normalize_url(url)
+            
             conn = self.db.get_connection()
             cursor = conn.cursor()
             
@@ -965,8 +1116,9 @@ class CrawlerThread(threading.Thread):
                 metadata_clean = {k: v for k, v in metadata.items() if k != 'content'}
                 metadata_json = json.dumps(metadata_clean) if metadata_clean else None
             
+            # 使用INSERT OR REPLACE防止重复插入相同URL
             cursor.execute('''
-                INSERT INTO url_records 
+                INSERT OR REPLACE INTO url_records 
                 (task_id, url, depth, status, status_code, response_time, file_size, 
                  content_type, title, author, description, keywords, publish_time,
                  error_message, metadata, created_at, completed_at)
@@ -1032,12 +1184,14 @@ class CrawlerThread(threading.Thread):
                 total_processed = self.total_urls_processed
                 queue_size = self.url_queue.qsize()
                 
-                # 如果队列不为空，说明还有URL待处理
-                if queue_size > 0:
-                    progress = (total_processed / max(total_discovered, 1)) * 100
+                # 计算真实进度：只有全部处理完才是100%
+                if total_discovered > 0:
+                    progress = (total_processed / total_discovered) * 100
+                    # 只有真正完成时才显示100.0%，避免四舍五入误导
+                    if progress >= 99.95 and total_processed < total_discovered:
+                        progress = 99.9  # 保留小数，明确显示未完全完成
                 else:
-                    # 队列为空，进度为100%
-                    progress = 100.0 if total_discovered > 0 else 0.0
+                    progress = 0.0
                 
                 # 成功率 = 成功数量 / 已处理数量
                 success_rate = (self.completed_count / max(total_processed, 1)) * 100 if total_processed > 0 else 0.0
@@ -1112,7 +1266,13 @@ class CrawlerThread(threading.Thread):
                 queue_size = self.url_queue.qsize()           # 队列中剩余的URL数量
                 
                 # 进度 = 已处理 / 总发现 * 100%
-                progress = (total_processed / max(total_discovered, 1)) * 100
+                if total_discovered > 0:
+                    progress = (total_processed / total_discovered) * 100
+                    # 避免四舍五入导致99.66%显示为100%
+                    if progress >= 99.95 and total_processed < total_discovered:
+                        progress = 99.9
+                else:
+                    progress = 0.0
                 
                 # 调试信息
                 logger.info(f"Progress calculation: {total_processed}/{total_discovered} = {progress:.1f}%, queue_size={queue_size}")
@@ -1681,7 +1841,13 @@ def get_monitor_data(task_id):
                 with crawler.queue_lock:
                     total_processed = crawler.completed_count + crawler.failed_count
                     success_rate = (crawler.completed_count / max(total_processed, 1)) * 100 if total_processed > 0 else 0.0
-                    progress = (total_processed / max(crawler.total_urls_discovered, 1)) * 100 if crawler.total_urls_discovered > 0 else 0.0
+                    if crawler.total_urls_discovered > 0:
+                        progress = (total_processed / crawler.total_urls_discovered) * 100
+                        # 避免误导性的100%显示
+                        if progress >= 99.95 and total_processed < crawler.total_urls_discovered:
+                            progress = 99.9
+                    else:
+                        progress = 0.0
                     
                     monitor_data = {
                         'task_id': task_id,
@@ -2196,6 +2362,58 @@ def get_task_analysis(task_id):
         for row in time_data:
             response_time_distribution[row[0]] = row[1]
         
+        # 热度分布 - 从metadata中提取热度分数
+        cursor.execute('''
+            SELECT 
+                CASE 
+                    WHEN CAST(JSON_EXTRACT(metadata, '$.popularity_score') AS INTEGER) < 100 THEN 0
+                    WHEN CAST(JSON_EXTRACT(metadata, '$.popularity_score') AS INTEGER) < 1000 THEN 1
+                    WHEN CAST(JSON_EXTRACT(metadata, '$.popularity_score') AS INTEGER) < 10000 THEN 2
+                    WHEN CAST(JSON_EXTRACT(metadata, '$.popularity_score') AS INTEGER) < 100000 THEN 3
+                    ELSE 4
+                END as popularity_range,
+                COUNT(*) as count
+            FROM url_records 
+            WHERE task_id = ? AND status = 'completed' 
+                AND metadata IS NOT NULL 
+                AND JSON_EXTRACT(metadata, '$.popularity_score') IS NOT NULL
+                AND CAST(JSON_EXTRACT(metadata, '$.popularity_score') AS INTEGER) > 0
+            GROUP BY popularity_range
+            ORDER BY popularity_range
+        ''', (task_id,))
+        popularity_data = cursor.fetchall()
+        popularity_distribution = []
+        ranges = ['0-100', '100-1k', '1k-1万', '1万-10万', '10万+']
+        range_counts = [0, 0, 0, 0, 0]
+        for row in popularity_data:
+            range_counts[row[0]] = row[1]
+        
+        for i, count in enumerate(range_counts):
+            popularity_distribution.append({'range': ranges[i], 'count': count})
+        
+        # 热度排行榜 - 获取热度最高的前10个URL
+        cursor.execute('''
+            SELECT url, title, 
+                   CAST(JSON_EXTRACT(metadata, '$.popularity_score') AS INTEGER) as popularity_score,
+                   CAST(JSON_EXTRACT(metadata, '$.view_count') AS INTEGER) as view_count,
+                   CAST(JSON_EXTRACT(metadata, '$.like_count') AS INTEGER) as like_count
+            FROM url_records 
+            WHERE task_id = ? AND status = 'completed' 
+                AND metadata IS NOT NULL 
+                AND JSON_EXTRACT(metadata, '$.popularity_score') IS NOT NULL
+                AND CAST(JSON_EXTRACT(metadata, '$.popularity_score') AS INTEGER) > 0
+            ORDER BY CAST(JSON_EXTRACT(metadata, '$.popularity_score') AS INTEGER) DESC
+            LIMIT 10
+        ''', (task_id,))
+        top_popular_urls = []
+        for row in cursor.fetchall():
+            top_popular_urls.append({
+                'url': row[0],
+                'title': row[1] or '无标题',
+                'popularity_score': row[2] or 0,
+                'view_count': row[3] or 0,
+                'like_count': row[4] or 0
+            })
         
         conn.close()
         
@@ -2204,7 +2422,9 @@ def get_task_analysis(task_id):
             'data': {
                 'depth_distribution': depth_distribution,
                 'size_distribution': size_distribution,
-                'response_time_distribution': response_time_distribution
+                'response_time_distribution': response_time_distribution,
+                'popularity_distribution': popularity_distribution,
+                'top_popular_urls': top_popular_urls
             }
         })
     

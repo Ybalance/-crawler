@@ -792,6 +792,83 @@ body {
     max-height: 300px;
 }
 
+.stats-card.full-width {
+    grid-column: 1 / -1;
+}
+
+/* 热度排行榜样式 */
+.popularity-ranking {
+    max-height: 400px;
+    overflow-y: auto;
+}
+
+.popularity-item {
+    display: flex;
+    align-items: center;
+    padding: 12px;
+    margin-bottom: 8px;
+    background: var(--bg-tertiary);
+    border-radius: 8px;
+    border-left: 4px solid var(--color-primary);
+    transition: all 0.2s ease;
+}
+
+.popularity-item:hover {
+    background: var(--bg-primary);
+    transform: translateX(4px);
+}
+
+.popularity-rank {
+    font-size: 1.2em;
+    font-weight: bold;
+    color: var(--color-primary);
+    min-width: 40px;
+    text-align: center;
+}
+
+.popularity-rank.top-1 { color: #FFD700; }
+.popularity-rank.top-2 { color: #C0C0C0; }
+.popularity-rank.top-3 { color: #CD7F32; }
+
+.popularity-info {
+    flex: 1;
+    margin-left: 12px;
+}
+
+.popularity-url {
+    font-weight: 500;
+    color: var(--text-primary);
+    margin-bottom: 4px;
+    word-break: break-all;
+}
+
+.popularity-title {
+    font-size: 0.9em;
+    color: var(--text-secondary);
+    margin-bottom: 4px;
+}
+
+.popularity-stats {
+    display: flex;
+    gap: 16px;
+    font-size: 0.85em;
+    color: var(--text-secondary);
+}
+
+.popularity-stat {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.popularity-score {
+    font-size: 1.1em;
+    font-weight: bold;
+    color: var(--color-warning);
+    min-width: 80px;
+    text-align: right;
+}
+
 .stats-info {
     background-color: var(--bg-secondary);
     border-radius: 12px;

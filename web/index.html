@@ -91,10 +91,7 @@
                                         <i class="fas fa-play-circle"></i> 爬取继续
                                     </button>
                                     <button class="btn btn-dark" onclick="pauseQueue()" id="btnPauseQueue" disabled>
-                                        <i class="fas fa-pause-circle"></i> 队列暂停
-                                    </button>
-                                    <button class="btn btn-primary" onclick="resumeQueue()" id="btnResumeQueue" disabled>
-                                        <i class="fas fa-play-circle"></i> 队列继续
+                                        <i class="fas fa-stop-circle"></i> 队列停止
                                     </button>
                                     <button class="btn btn-danger" onclick="stopTask()" id="btnStop" disabled>
                                         <i class="fas fa-stop"></i> 停止
@@ -299,6 +296,21 @@
                                     <h3><i class="fas fa-clock"></i> 响应时间分布</h3>
                                     <canvas id="responseTimeChart"></canvas>
                                 </div>
+                                <div class="stats-card">
+                                    <h3><i class="fas fa-fire"></i> 热度分析</h3>
+                                    <canvas id="popularityChart"></canvas>
+                                </div>
+                            </div>
+                            <div class="stats-row">
+                                <div class="stats-card full-width">
+                                    <h3><i class="fas fa-trophy"></i> 热度排行榜</h3>
+                                    <div id="popularityRanking" class="popularity-ranking">
+                                        <div class="empty-state">
+                                            <i class="fas fa-chart-bar"></i>
+                                            <p>暂无热度数据</p>
+                                        </div>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -351,6 +363,7 @@
                                 <option value="bfs">广度优先(BFS)</option>
                                 <option value="dfs">深度优先(DFS)</option>
                                 <option value="priority">优先级策略</option>
+                                <option value="popularity">热度优先</option>
                             </select>
                         </div>
                         <div class="form-group">
@@ -384,6 +397,12 @@
                         <label class="checkbox-label">
                             <input type="checkbox" name="allow_cross_domain">
                             <span>允许跨域爬取</span>
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" name="create_both_strategies">
+                            <span>同时创建BFS和DFS两个任务（用于对比）</span>
                         </label>
                     </div>
                     <div class="form-actions">
@@ -427,6 +446,7 @@
                                 <option value="bfs">广度优先(BFS)</option>
                                 <option value="dfs">深度优先(DFS)</option>
                                 <option value="priority">优先级策略</option>
+                                <option value="popularity">热度优先</option>
                             </select>
                         </div>
                         <div class="form-group">
